@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, '/app')
 
@@ -10,6 +11,6 @@ if not api_secret:
 
 from src.model_downloader import ensure_weights
 
-# Compiled ensure_weights takes exactly 2 positional args: (models_dir, api_secret)
-path = ensure_weights('/data/models', api_secret)
+# Compiled ensure_weights expects (models_dir: Path, api_secret: str)
+path = ensure_weights(Path('/data/models'), api_secret)
 print(f"Decrypted weights at: {path}")
