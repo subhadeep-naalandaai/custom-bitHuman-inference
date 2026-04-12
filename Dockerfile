@@ -4,18 +4,13 @@ FROM sgubithuman/expression-avatar:latest
 # The compiled module calls api.bithuman.ai to exchange the secret for an HF token,
 # downloads from the private HF repo, encrypts to /data/models, decrypts to /tmp/bh-weights.
 # We then copy the decrypted weights to /opt/bh-weights and clean up the encrypted blobs.
+COPY scripts/fetch_weights.py /tmp/fetch_weights.py
 RUN --mount=type=secret,id=bithuman_secret \
     cd /app && \
-    python3 -c "
-import os, sys
-sys.path.insert(0, '/app')
-os.environ['BITHUMAN_API_SECRET'] = open('/run/secrets/bithuman_secret').read().strip()
-from src.model_downloader import ensure_weights
-path = ensure_weights(api_secret=os.environ['BITHUMAN_API_SECRET'])
-print('Decrypted weights at:', path)
-" && \
+    BITHUMAN_API_SECRET=$(cat /run/secrets/bithuman_secret) \
+    python3 /tmp/fetch_weights.py && \
     cp -r /tmp/bh-weights /opt/bh-weights && \
-    rm -rf /data/models
+    rm -rf /data/models /tmp/fetch_weights.py
 
 # Set weights path so our model_downloader stub finds them
 ENV BITHUMAN_WEIGHTS_PATH=/opt/bh-weights
