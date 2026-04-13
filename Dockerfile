@@ -20,3 +20,8 @@ COPY app/billing/heartbeat.py /app/billing/heartbeat.py
 
 # Override compiled model downloader with a local-weights stub
 COPY app/src/model_downloader.py /app/src/model_downloader.py
+
+# Add standalone inference CLI (no compiled deps, no billing, no network)
+COPY inference/ /app/inference/
+COPY run.py /app/run.py
+RUN pip install --no-cache-dir torchaudio "imageio[ffmpeg]"
