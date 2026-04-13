@@ -8,6 +8,12 @@ HF_REPO = "token-wizard-naalanda/bithuman-weights"
 _DEFAULT_WEIGHTS = "/workspace/bh-weights"
 
 
+def _get_hf_token_and_key(*args, **kwargs):
+    """Return (hf_token, api_key) — stub bypasses bithuman API, reads HF_TOKEN from env."""
+    token = os.environ.get("HF_TOKEN", "")
+    return token, ""
+
+
 def ensure_weights(models_dir=None, api_secret=None, *args, **kwargs):
     if models_dir is None:
         models_dir = Path(os.environ.get("BITHUMAN_WEIGHTS_PATH", _DEFAULT_WEIGHTS))
@@ -17,7 +23,7 @@ def ensure_weights(models_dir=None, api_secret=None, *args, **kwargs):
     marker = models_dir / "bithuman-expression" / "Model_Lite" / "config.json"
     if marker.exists():
         logger.info(f"Weights already present at {models_dir}")
-        return str(models_dir)
+        return models_dir
 
     token = os.environ.get("HF_TOKEN", "")
     if not token:
@@ -30,4 +36,4 @@ def ensure_weights(models_dir=None, api_secret=None, *args, **kwargs):
     from huggingface_hub import snapshot_download
     snapshot_download(repo_id=HF_REPO, local_dir=str(models_dir), token=token)
     logger.info("[downloader] Download complete.")
-    return str(models_dir)
+    return models_dir

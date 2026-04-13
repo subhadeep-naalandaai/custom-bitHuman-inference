@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 logger = logging.getLogger("heartbeat")
@@ -14,7 +15,9 @@ async def initialize_heartbeat_with_retry(attributes, *args, **kwargs):
 
 
 def start_heartbeat_task(attributes, shutdown_event=None, *args, **kwargs):
-    return None  # falsy → dispatcher skips cleanup_heartbeat_task
+    async def _noop():
+        pass
+    return asyncio.ensure_future(_noop())
 
 
 async def cleanup_heartbeat_task(heartbeat_task, *args, **kwargs):
