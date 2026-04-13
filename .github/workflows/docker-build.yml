@@ -35,4 +35,4 @@ jobs:
           push: true
           tags: subhadeepnaalanda/bithuman-local:latest
           secrets: |
-            bithuman_secret=${{ secrets.BITHUMAN_SECRET }}
+            hf_token=${{ secrets.HF_TOKEN }}

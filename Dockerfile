@@ -1,16 +1,12 @@
 FROM sgubithuman/expression-avatar:latest
 
-# Use the original model_downloader to fetch + decrypt weights via BITHUMAN_API_SECRET.
-# The compiled module calls api.bithuman.ai to exchange the secret for an HF token,
-# downloads from the private HF repo, encrypts to /data/models, decrypts to /tmp/bh-weights.
-# We then copy the decrypted weights to /opt/bh-weights and clean up the encrypted blobs.
-COPY scripts/fetch_weights.py /tmp/fetch_weights.py
-RUN --mount=type=secret,id=bithuman_secret \
-    cd /app && \
-    BITHUMAN_API_SECRET=$(cat /run/secrets/bithuman_secret) \
-    python3 /tmp/fetch_weights.py && \
-    cp -r /tmp/bh-weights /opt/bh-weights && \
-    rm -rf /data/models /tmp/fetch_weights.py
+# Download pre-decrypted weights from user's own private HuggingFace repo.
+# No bitHuman API needed — weights were uploaded once from local bh-weights/.
+RUN --mount=type=secret,id=hf_token \
+    pip install -q huggingface_hub && \
+    huggingface-cli download token-wizard-naalanda/bithuman-weights \
+      --local-dir /opt/bh-weights \
+      --token $(cat /run/secrets/hf_token)
 
 # Set weights path so our model_downloader stub finds them
 ENV BITHUMAN_WEIGHTS_PATH=/opt/bh-weights
