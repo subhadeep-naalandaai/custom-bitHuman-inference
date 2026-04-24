@@ -1,22 +1,29 @@
 """
 bithuman_expression/src/modules/expression_model.py
-Python replacement for expression_model.cpython-310-x86_64-linux-gnu.so
 
-Audio-conditioned Diffusion Transformer (DiT) for expression avatar generation.
+BitHuman Expression Model — reverse-engineered from bithuman_expression_dit_1_3b.safetensors.
 
-Architecture:
-  - Video latent tokens are patchified and fed into a sequence of DiTAudioBlocks
-  - Each block performs: AdaLN self-attention → audio cross-attention → MLP
-  - Positional encoding via 3-D RoPE (time × height × width)
-  - Audio features are projected by AudioProjModel before cross-attention
+Actual architecture (confirmed from weight shapes):
+  hidden dim (dim):  1536
+  audio cross-attn:  1536-dim keys/values
+  num_heads:         12  →  head_dim = 1536/12 = 128
+  num_layers:        30
+  ffn_dim:           8960
+  in_channels:       256   (noisy_latent ∥ ref_latent, each 128-ch)
+  out_channels:      128
+  freq_dim:          256   (sinusoidal timestep embedding)
+  audio_dim:         768   (Wav2Vec2-base hidden size)
 
-Classes:
-  RMSNorm, MLP, SelfAttention, CrossAttention,
-  DiTAudioBlock, AudioProjModel, Head, ExpressionModel
-
-Free functions:
-  flash_attention, sinusoidal_embedding_1d,
-  precompute_freqs_cis, precompute_freqs_cis_3d, pad_freqs, rope_apply
+Layer names (as stored in safetensors after stripping "bithuman." prefix):
+  patch_embedding            Conv3d(256, 1536, 1)
+  time_embedding.{0,2}       Linear(256→1536→1536) with SiLU
+  time_projection.1          Linear(1536, 9216=6×1536)  [with SiLU at idx 0]
+  text_embedding.{0,2}       Linear(4096→1536→1536) — null/unused in audio-only mode
+  audio_emb.proj.{0,1,3,4}  LayerNorm(768) → Linear(768,768) → SiLU → Linear(768,1536) → LayerNorm(1536)
+  audio_proj.{norm,proj1,proj1_vf,proj2,proj3}
+                             Aggregates audio sequence into 32 global conditioning tokens
+  blocks.{0..29}             DiTBlock(dim=1536, ffn_dim=8960, num_heads=12)
+  head.{head,modulation}     Final linear + AdaLN bias
 """
 
 import math
@@ -25,584 +32,386 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
-def sinusoidal_embedding_1d(dim: int, seq_len: int) -> torch.Tensor:
-    """
-    Create a 1-D sinusoidal positional embedding.
-
-    Args:
-        dim:     embedding dimension (must be even)
-        seq_len: number of positions
-
-    Returns:
-        (seq_len, dim) float tensor
-    """
+def sinusoidal_embedding_1d(dim: int, length: int) -> torch.Tensor:
     half = dim // 2
-    freqs = torch.exp(
-        -math.log(10000.0) * torch.arange(0, half, dtype=torch.float32) / half
-    )
-    positions = torch.arange(seq_len, dtype=torch.float32)
-    args = positions.unsqueeze(1) * freqs.unsqueeze(0)   # (seq_len, half)
-    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-
-def precompute_freqs_cis(freq_dim: int, seq_len: int, theta: float = 10000.0) -> torch.Tensor:
-    """
-    Precompute complex exponentials for 1-D RoPE.
-
-    Args:
-        freq_dim: half of the head dimension
-        seq_len:  maximum sequence length
-        theta:    RoPE base frequency
-
-    Returns:
-        (seq_len, freq_dim) complex64 tensor
-    """
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, freq_dim, 2, dtype=torch.float32) / freq_dim)
-    )
-    t = torch.arange(seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)                       # (seq_len, freq_dim//2)
-    freqs = torch.polar(torch.ones_like(freqs), freqs)  # complex
-    return freqs
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half)
+    pos   = torch.arange(length, dtype=torch.float32)
+    emb   = pos.unsqueeze(1) * freqs.unsqueeze(0)
+    return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)   # (length, dim)
 
 
 def precompute_freqs_cis_3d(
-    freq_dim: int,
-    t_len: int,
-    h_len: int,
-    w_len: int,
-    theta: float = 10000.0,
+    head_dim: int, t_len: int, h_len: int, w_len: int, theta: float = 10000.0
 ) -> torch.Tensor:
-    """
-    Precompute complex exponentials for 3-D RoPE (time × height × width).
+    """3-D RoPE frequencies for (T×H×W) positions, shape (T*H*W, head_dim//2) complex."""
+    d = head_dim // 6
 
-    Each spatial-temporal position (t, h, w) gets a combined frequency by
-    splitting freq_dim equally among the three axes.
+    def _1d(n):
+        f = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d))
+        t = torch.arange(n, dtype=torch.float32)
+        return torch.polar(torch.ones_like(torch.outer(t, f)), torch.outer(t, f))
 
-    Args:
-        freq_dim: total frequency dimension (split evenly across T/H/W)
-        t_len, h_len, w_len: grid extents
-        theta:    RoPE base
-
-    Returns:
-        (t_len * h_len * w_len, freq_dim) complex64 tensor
-    """
-    dim_each = freq_dim // 3
-
-    def _1d(length, d):
-        freqs = 1.0 / (
-            theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d)
-        )
-        t = torch.arange(length, dtype=torch.float32)
-        freqs = torch.outer(t, freqs)
-        return torch.polar(torch.ones_like(freqs), freqs)   # (length, d//2) complex
-
-    ft = _1d(t_len, dim_each)   # (T, D/6) complex
-    fh = _1d(h_len, dim_each)
-    fw = _1d(w_len, dim_each)
-
-    # Broadcast over a 3-D grid
-    ft = ft.unsqueeze(1).unsqueeze(1).expand(-1, h_len, w_len, -1)
-    fh = fh.unsqueeze(0).unsqueeze(2).expand(t_len, -1, w_len, -1)
-    fw = fw.unsqueeze(0).unsqueeze(0).expand(t_len, h_len, -1, -1)
-
-    freqs = torch.cat([ft, fh, fw], dim=-1)    # (T, H, W, freq_dim//2) complex
+    ft = _1d(t_len).unsqueeze(1).unsqueeze(1).expand(-1, h_len, w_len, -1)
+    fh = _1d(h_len).unsqueeze(0).unsqueeze(2).expand(t_len, -1, w_len, -1)
+    fw = _1d(w_len).unsqueeze(0).unsqueeze(0).expand(t_len, h_len, -1, -1)
+    freqs = torch.cat([ft, fh, fw], dim=-1)              # (T,H,W, head_dim//2)
     return freqs.reshape(t_len * h_len * w_len, -1)
 
 
-def pad_freqs(freqs: torch.Tensor, target_dim: int) -> torch.Tensor:
-    """
-    Pad a frequency tensor along the last dimension to target_dim by repeating.
-
-    Args:
-        freqs:      (..., D) complex tensor
-        target_dim: desired last dimension
-
-    Returns:
-        (..., target_dim) complex tensor
-    """
-    current = freqs.shape[-1]
-    if current >= target_dim:
-        return freqs[..., :target_dim]
-    repeat = math.ceil(target_dim / current)
-    return freqs.repeat(*([1] * (freqs.ndim - 1)), repeat)[..., :target_dim]
-
-
-def rope_apply(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Apply rotary position embeddings to query/key tensors.
-
-    Args:
-        x:         (B, L, num_heads, head_dim) float tensor
-        freqs_cis: (L, head_dim // 2) complex tensor
-
-    Returns:
-        same shape as x, with RoPE applied
-    """
-    # View as complex: (B, L, num_heads, head_dim//2) complex
+def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Apply RoPE to (B, L, H, D); freqs is (L, D//2) complex."""
     x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs = freqs_cis.unsqueeze(0).unsqueeze(2)      # (1, L, 1, head_dim//2)
-    x_out = torch.view_as_real(x_c * freqs).flatten(-2)
-    return x_out.to(x.dtype)
+    out  = torch.view_as_real(x_c * freqs.unsqueeze(0).unsqueeze(2)).flatten(-2)
+    return out.to(x.dtype)
 
 
-def flash_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0,
-) -> torch.Tensor:
-    """
-    Scaled dot-product attention (uses torch SDPA which dispatches to
-    FlashAttention when available).
-
-    Args:
-        q, k, v:   (B, num_heads, L, head_dim)
-        attn_mask: optional attention bias
-        dropout_p: dropout probability (training only)
-
-    Returns:
-        (B, num_heads, L, head_dim)
-    """
-    return F.scaled_dot_product_attention(
-        q, k, v,
-        attn_mask=attn_mask,
-        dropout_p=dropout_p if torch.is_grad_enabled() else 0.0,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Normalisation
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Sub-modules
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalisation (no mean subtraction)."""
-
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
+        self.eps    = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x.float()).to(x.dtype) * self.weight
+        n = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * n).to(x.dtype) * self.weight
 
-
-# ---------------------------------------------------------------------------
-# Feed-forward
-# ---------------------------------------------------------------------------
-
-class MLP(nn.Module):
-    """SwiGLU feed-forward network."""
-
-    def __init__(self, in_dim: int, ffn_dim: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(in_dim, ffn_dim, bias=False)
-        self.up_proj   = nn.Linear(in_dim, ffn_dim, bias=False)
-        self.down_proj = nn.Linear(ffn_dim, in_dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-# ---------------------------------------------------------------------------
-# Attention
-# ---------------------------------------------------------------------------
 
 class SelfAttention(nn.Module):
-    """Multi-head self-attention with RoPE."""
+    """Multi-head self-attention with RMSNorm on Q/K and RoPE."""
 
-    def __init__(self, in_dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
-        assert in_dim % num_heads == 0
         self.num_heads = num_heads
-        self.head_dim  = in_dim // num_heads
-        self.qkv = nn.Linear(in_dim, 3 * in_dim, bias=False)
-        self.out = nn.Linear(in_dim, in_dim, bias=False)
+        self.head_dim  = dim // num_heads
+        self.q      = nn.Linear(dim, dim, bias=True)
+        self.k      = nn.Linear(dim, dim, bias=True)
+        self.v      = nn.Linear(dim, dim, bias=True)
+        self.o      = nn.Linear(dim, dim, bias=True)
+        self.norm_q = RMSNorm(self.head_dim)
+        self.norm_k = RMSNorm(self.head_dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x:         (B, L, C)
-            freqs_cis: (L, head_dim//2) complex — RoPE frequencies
-
-        Returns:
-            (B, L, C)
-        """
+    def forward(self, x: torch.Tensor, freqs: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, C = x.shape
-        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)                          # (B, L, H, D)
+        H, D    = self.num_heads, self.head_dim
 
-        if freqs_cis is not None:
-            q = rope_apply(q, freqs_cis)
-            k = rope_apply(k, freqs_cis)
+        q = self.q(x).view(B, L, H, D)
+        k = self.k(x).view(B, L, H, D)
+        v = self.v(x).view(B, L, H, D)
 
-        # (B, H, L, D) for SDPA
+        q = self.norm_q(q)
+        k = self.norm_k(k)
+
+        if freqs is not None:
+            q = rope_apply(q, freqs)
+            k = rope_apply(k, freqs)
+
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        out = flash_attention(q, k, v)                   # (B, H, L, D)
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L, C)
-        return self.out(out)
+        return self.o(out)
 
 
 class CrossAttention(nn.Module):
-    """Multi-head cross-attention (query from video, key/value from audio)."""
+    """Multi-head cross-attention (video queries, audio keys/values)."""
 
-    def __init__(self, in_dim: int, num_heads: int, text_dim: int):
+    def __init__(self, dim: int, num_heads: int):
         super().__init__()
-        assert in_dim % num_heads == 0
         self.num_heads = num_heads
-        self.head_dim  = in_dim // num_heads
-        self.q_proj  = nn.Linear(in_dim,   in_dim, bias=False)
-        self.kv_proj = nn.Linear(text_dim, 2 * in_dim, bias=False)
-        self.out     = nn.Linear(in_dim,   in_dim, bias=False)
+        self.head_dim  = dim // num_heads
+        self.q      = nn.Linear(dim, dim, bias=True)
+        self.k      = nn.Linear(dim, dim, bias=True)
+        self.v      = nn.Linear(dim, dim, bias=True)
+        self.o      = nn.Linear(dim, dim, bias=True)
+        self.norm_q = RMSNorm(self.head_dim)
+        self.norm_k = RMSNorm(self.head_dim)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        context: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x:       (B, L1, C)  — video tokens
-            context: (B, L2, text_dim) — audio context
-            mask:    optional (B, 1, L1, L2) attention bias
-
-        Returns:
-            (B, L1, C)
-        """
+    def forward(self, x: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
         B, L1, C = x.shape
-        _, L2, _ = context.shape
+        L2       = ctx.shape[1]
+        H, D     = self.num_heads, self.head_dim
 
-        q  = self.q_proj(x).reshape(B, L1, self.num_heads, self.head_dim).transpose(1, 2)
-        kv = self.kv_proj(context).reshape(B, L2, 2, self.num_heads, self.head_dim)
-        k, v = kv.unbind(2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        q = self.norm_q(self.q(x).view(B, L1, H, D)).transpose(1, 2)
+        k = self.norm_k(self.k(ctx).view(B, L2, H, D)).transpose(1, 2)
+        v = self.v(ctx).view(B, L2, H, D).transpose(1, 2)
 
-        out = flash_attention(q, k, v, attn_mask=mask)   # (B, H, L1, D)
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L1, C)
-        return self.out(out)
+        return self.o(out)
 
 
-# ---------------------------------------------------------------------------
-# DiT block
-# ---------------------------------------------------------------------------
-
-class DiTAudioBlock(nn.Module):
+class DiTBlock(nn.Module):
     """
-    Single Diffusion Transformer block with audio cross-attention.
-
-    Processing order (AdaLN-Zero style):
-      x = x + gate_sa  * SelfAttention(AdaLN(x, t_mod))
-      x = x + CrossAttention(x, audio)
-      x = x + gate_mlp * MLP(AdaLN(x, t_mod))
-
-    Args:
-        in_dim:    model (hidden) dimension
-        num_heads: number of attention heads
-        ffn_dim:   feed-forward expansion dimension
-        text_dim:  audio feature dimension
+    Single DiT block (matched to actual weight layout):
+      self_attn  with AdaLN-Zero modulation (gate/shift/scale × 2 for SA + FFN)
+      cross_attn on audio context
+      FFN: Linear → GELU → Linear (NOT SwiGLU — confirmed by 2-layer ffn.{0,2})
+      norm3: LayerNorm after cross-attn
+      modulation: [1, 6, dim] learnable bias added to global timestep mod
     """
 
-    def __init__(self, in_dim: int, num_heads: int, ffn_dim: int, text_dim: int):
+    def __init__(self, dim: int, ffn_dim: int, num_heads: int):
         super().__init__()
-        self.norm1 = RMSNorm(in_dim)
-        self.norm2 = RMSNorm(in_dim)
-        self.norm3 = RMSNorm(in_dim)
+        self.self_attn  = SelfAttention(dim, num_heads)
+        self.cross_attn = CrossAttention(dim, num_heads)
 
-        self.self_attn  = SelfAttention(in_dim, num_heads)
-        self.cross_attn = CrossAttention(in_dim, num_heads, text_dim)
-        self.mlp        = MLP(in_dim, ffn_dim)
-
-        # AdaLN-Zero modulation: predicts (shift_sa, scale_sa, gate_sa,
-        #                                   shift_mlp, scale_mlp, gate_mlp)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(in_dim, 6 * in_dim, bias=True),
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ffn_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(ffn_dim, dim, bias=True),
         )
 
+        self.norm3      = nn.LayerNorm(dim, elementwise_affine=True)
+        self.modulation = nn.Parameter(torch.zeros(1, 6, dim))
+
     def forward(
         self,
-        x: torch.Tensor,
-        t_mod: torch.Tensor,
-        audio_context: torch.Tensor,
-        freqs_cis: Optional[torch.Tensor] = None,
+        x:        torch.Tensor,            # (B, L, dim)
+        t_mod6:   torch.Tensor,            # (B, 6, dim) from time_projection
+        audio_ctx: torch.Tensor,           # (B, L_audio, dim)
+        freqs:    Optional[torch.Tensor],  # RoPE frequencies
     ) -> torch.Tensor:
-        """
-        Args:
-            x(Tensor):     Shape [B, L1, C]  — patchified video latents
-            t_mod(Tensor): Shape [B, C] or [B*T, C] — timestep modulation signal
-            audio_context: Shape [B, L_audio, text_dim]
-            freqs_cis:     Shape [L1, head_dim//2] complex
+        # Block-specific modulation = global timestep mod + learned offset
+        mod = (t_mod6 + self.modulation)   # (B, 6, dim)
+        shift_sa, scale_sa, gate_sa, shift_ff, scale_ff, gate_ff = mod.unbind(1)
 
-        Returns:
-            (B, L1, C)
-        """
-        B, L, C = x.shape
+        # Self-attention with AdaLN
+        h    = x * (1 + scale_sa.unsqueeze(1)) + shift_sa.unsqueeze(1)
+        x    = x + gate_sa.unsqueeze(1) * self.self_attn(h, freqs)
 
-        # Broadcast t_mod to match batch if needed
-        if t_mod.shape[0] != B:
-            t_mod = t_mod[:B]
+        # Cross-attention (no modulation, plain residual)
+        x = x + self.cross_attn(self.norm3(x), audio_ctx)
 
-        mods = self.adaLN_modulation(t_mod)               # (B, 6*C)
-        shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp = mods.chunk(6, dim=-1)
-
-        # Self-attention branch
-        x_sa = self.norm1(x) * (1 + scale_sa.unsqueeze(1)) + shift_sa.unsqueeze(1)
-        x = x + gate_sa.unsqueeze(1) * self.self_attn(x_sa, freqs_cis)
-
-        # Audio cross-attention (no modulation)
-        x = x + self.cross_attn(self.norm2(x), audio_context)
-
-        # MLP branch
-        x_mlp = self.norm3(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_mlp)
+        # FFN with AdaLN
+        h = x * (1 + scale_ff.unsqueeze(1)) + shift_ff.unsqueeze(1)
+        x = x + gate_ff.unsqueeze(1) * self.ffn(h)
 
         return x
 
 
-# ---------------------------------------------------------------------------
-# Audio projection
-# ---------------------------------------------------------------------------
-
-class AudioProjModel(nn.Module):
+class AudioEmbedding(nn.Module):
     """
-    Projects audio encoder features to the model's hidden dimension.
-
-    A simple two-layer MLP with LayerNorm.
+    Wav2Vec2 features (768-dim) → model hidden dim (1536).
+    Weight layout: proj.{0,1,3,4} → LayerNorm→Linear→SiLU→Linear→LayerNorm
     """
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, audio_dim: int = 768, dim: int = 1536):
         super().__init__()
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.SiLU(),
-            nn.Linear(out_dim, out_dim),
+            nn.LayerNorm(audio_dim),       # idx 0
+            nn.Linear(audio_dim, audio_dim, bias=True),  # idx 1
+            nn.SiLU(),                     # idx 2  (no params)
+            nn.Linear(audio_dim, dim, bias=True),        # idx 3
+            nn.LayerNorm(dim),             # idx 4
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, T_audio, in_dim) — audio features from Wav2Vec2
-
-        Returns:
-            (B, T_audio, out_dim)
-        """
         return self.proj(x)
 
 
-# ---------------------------------------------------------------------------
-# Output head
-# ---------------------------------------------------------------------------
-
-class Head(nn.Module):
+class AudioProjection(nn.Module):
     """
-    Final prediction head: AdaLN + linear projection to output channels.
+    Aggregates per-frame audio features into a fixed set of global
+    conditioning tokens appended to the cross-attention context.
+
+    Two input size variants:
+      proj1    — expects audio_len == SHORT_LEN  (30 frames × dim = 46080)
+      proj1_vf — expects audio_len == LONG_LEN   (72 frames × dim = 110592)
+
+    Output: (B, 32, dim)  — 32 global conditioning tokens
     """
 
-    def __init__(self, in_dim: int, out_dim: int):
+    SHORT_LEN = 30   # 46080 / 1536
+    LONG_LEN  = 72   # 110592 / 1536
+
+    def __init__(self, dim: int = 1536):
         super().__init__()
-        self.norm = RMSNorm(in_dim)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(in_dim, 2 * in_dim, bias=True),
-        )
-        self.proj = nn.Linear(in_dim, out_dim, bias=True)
+        self.norm     = nn.LayerNorm(dim)
+        self.proj1    = nn.Linear(self.SHORT_LEN * dim, 512, bias=True)
+        self.proj1_vf = nn.Linear(self.LONG_LEN  * dim, 512, bias=True)
+        self.proj2    = nn.Linear(512, 512, bias=True)
+        self.proj3    = nn.Linear(512, 32 * dim, bias=True)
+        self.dim      = dim
 
-    def forward(self, x: torch.Tensor, t_mod: torch.Tensor) -> torch.Tensor:
+    def forward(self, audio_emb_out: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x:     (B, L, in_dim)
-            t_mod: (B, in_dim) timestep modulation
-
-        Returns:
-            (B, L, out_dim)
+        audio_emb_out: (B, L, dim) — output of AudioEmbedding
+        Returns: (B, 32, dim) global conditioning tokens
         """
-        shift, scale = self.adaLN_modulation(t_mod).chunk(2, dim=-1)
-        x = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        return self.proj(x)
+        B, L, D = audio_emb_out.shape
+        x = self.norm(audio_emb_out)                # (B, L, dim)
+
+        flat = x.reshape(B, -1)                     # (B, L*dim)
+
+        # Choose pathway by audio length
+        if L == self.LONG_LEN:
+            h = F.silu(self.proj1_vf(flat))
+        else:
+            # Resize flat to SHORT_LEN*dim regardless of actual length
+            if flat.shape[1] != self.SHORT_LEN * D:
+                flat = F.interpolate(
+                    flat.unsqueeze(1),
+                    size=self.SHORT_LEN * D,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(1)
+            h = F.silu(self.proj1(flat))
+
+        h = F.silu(self.proj2(h))                   # (B, 512)
+        out = self.proj3(h)                          # (B, 32*dim)
+        return out.view(B, 32, D)                    # (B, 32, dim)
 
 
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
-
-class ExpressionModel(nn.Module):
+class OutputHead(nn.Module):
     """
-    Audio-conditioned Diffusion Transformer for expression avatar generation.
+    Final AdaLN + linear prediction head.
+    Weight layout: head.head + head.modulation [1, 2, dim]
+    """
 
-    Takes noisy video latent patches + audio features + timestep and predicts
-    the denoised latent (flow-matching velocity field).
+    def __init__(self, dim: int, out_channels: int):
+        super().__init__()
+        self.head       = nn.Linear(dim, out_channels, bias=True)
+        self.modulation = nn.Parameter(torch.zeros(1, 2, dim))
 
-    Args:
-        in_dim:     input latent patch channels
-        out_dim:    output latent patch channels (usually == in_dim)
-        freq_dim:   sinusoidal timestep embedding dimension
-        ffn_dim:    feed-forward hidden dimension inside each DiT block
-        num_heads:  number of attention heads
-        num_layers: number of DiTAudioBlocks
-        text_dim:   audio feature dimension (from Wav2Vec2 + AudioProjModel)
+    def forward(self, x: torch.Tensor, t_mod6: torch.Tensor) -> torch.Tensor:
+        # Use first 2 of the 6 modulation channels (shift, scale)
+        head_mod = t_mod6[:, :2, :] + self.modulation   # (B, 2, dim)
+        shift, scale = head_mod.unbind(1)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        return self.head(x)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main model
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BitHumanExpressionModel(nn.Module):
+    """
+    Audio-conditioned video generation DiT.
+    Matches the weights in bithuman_expression_dit_1_3b.safetensors.
+
+    Input:
+      x:             (B, in_channels=256, T, H, W)
+                     Concatenation of [noisy_latent (128-ch) ∥ ref_latent (128-ch)]
+      t:             (B,) float in [0, 1]  — flow-matching timestep
+      audio_features:(B, L_audio, audio_dim=768)  — Wav2Vec2 frame features
+      freqs_cis:     optional precomputed 3-D RoPE (omit to compute on-the-fly)
+
+    Output:
+      (B, out_channels=128, T, H, W) — predicted velocity field
     """
 
     def __init__(
         self,
-        in_dim:     int,
-        out_dim:    int,
-        freq_dim:   int,
-        ffn_dim:    int,
-        num_heads:  int,
-        num_layers: int,
-        text_dim:   int,
+        dim:          int = 1536,
+        in_channels:  int = 256,
+        out_channels: int = 128,
+        freq_dim:     int = 256,
+        ffn_dim:      int = 8960,
+        num_heads:    int = 12,
+        num_layers:   int = 30,
+        audio_dim:    int = 768,
+        text_dim:     int = 4096,
     ):
         super().__init__()
-        self.in_dim    = in_dim
-        self.out_dim   = out_dim
-        self.num_heads = num_heads
-        self.head_dim  = in_dim // num_heads
+        self.dim          = dim
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.freq_dim     = freq_dim
+        self.num_heads    = num_heads
+        self.head_dim     = dim // num_heads
 
-        # Patch embedding
-        self.patch_embed = nn.Linear(in_dim, in_dim, bias=True)
+        # Input: patchify video latent (no spatial patching; kernel=(1,1,1))
+        self.patch_embedding = nn.Conv3d(in_channels, dim, kernel_size=1, bias=True)
 
-        # Timestep embedding: sinusoidal → MLP
-        self.time_embed = nn.Sequential(
-            nn.Linear(freq_dim, in_dim * 4),
+        # Timestep embedding
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim, bias=True),
             nn.SiLU(),
-            nn.Linear(in_dim * 4, in_dim),
+            nn.Linear(dim, dim, bias=True),
         )
-        self.freq_dim = freq_dim
 
-        # Audio projection
-        self.audio_proj = AudioProjModel(text_dim, in_dim)
+        # Global AdaLN modulation (SiLU + Linear, weights at index 1)
+        self.time_projection = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+
+        # Text/null conditioning (4096-dim → dim; not used in audio-only inference)
+        self.text_embedding = nn.Sequential(
+            nn.Linear(text_dim, dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(dim, dim, bias=True),
+        )
+
+        # Audio embedding: Wav2Vec2 768 → 1536
+        self.audio_emb  = AudioEmbedding(audio_dim, dim)
+
+        # Global audio projection: aggregates audio sequence → 32 conditioning tokens
+        self.audio_proj = AudioProjection(dim)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            DiTAudioBlock(in_dim, num_heads, ffn_dim, in_dim)
-            for _ in range(num_layers)
+            DiTBlock(dim, ffn_dim, num_heads) for _ in range(num_layers)
         ])
 
         # Output head
-        self.head = Head(in_dim, out_dim)
-
-    # ------------------------------------------------------------------
-    # Patchify / unpatchify
-    # ------------------------------------------------------------------
-
-    def patchify(
-        self,
-        x: torch.Tensor,
-        patch_size: Tuple[int, int, int] = (1, 2, 2),
-    ) -> torch.Tensor:
-        """
-        Reshape video latent into a flat sequence of patches.
-
-        Args:
-            x:          (B, C, T, H, W)
-            patch_size: (pt, ph, pw)
-
-        Returns:
-            (B, T//pt * H//ph * W//pw, C * pt * ph * pw)
-        """
-        pt, ph, pw = patch_size
-        return rearrange(
-            x,
-            "b c (t pt) (h ph) (w pw) -> b (t h w) (c pt ph pw)",
-            pt=pt, ph=ph, pw=pw,
-        )
-
-    def unpatchify(
-        self,
-        x: torch.Tensor,
-        t: int,
-        h: int,
-        w: int,
-        patch_size: Tuple[int, int, int] = (1, 2, 2),
-    ) -> torch.Tensor:
-        """
-        Reshape flat patch sequence back to video latent shape.
-
-        Args:
-            x:          (B, T//pt * H//ph * W//pw, C * pt * ph * pw)
-            t, h, w:    grid dimensions (in patches)
-            patch_size: (pt, ph, pw)
-
-        Returns:
-            (B, C, T, H, W)
-        """
-        pt, ph, pw = patch_size
-        return rearrange(
-            x,
-            "b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)",
-            t=t, h=h, w=w, pt=pt, ph=ph, pw=pw,
-        )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+        self.head = OutputHead(dim, out_channels)
 
     def forward(
         self,
-        x: torch.Tensor,
-        t: torch.Tensor,
+        x:              torch.Tensor,
+        t:              torch.Tensor,
         audio_features: torch.Tensor,
-        patch_size: Tuple[int, int, int] = (1, 2, 2),
-        freqs_cis: Optional[torch.Tensor] = None,
+        freqs_cis:      Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Args:
-            x:              (B, C, T, H, W) noisy video latent
-            t:              (B,) float timesteps in [0, 1]
-            audio_features: (B, L_audio, text_dim) from Wav2Vec2
-            patch_size:     spatial/temporal patch stride
-            freqs_cis:      precomputed 3-D RoPE frequencies (optional)
-
-        Returns:
-            (B, C, T, H, W) predicted velocity (flow-matching target)
-        """
         B, C, T, H, W = x.shape
-        pt, ph, pw = patch_size
-        gt, gh, gw = T // pt, H // ph, W // pw
 
-        # Timestep embedding
-        t_emb = sinusoidal_embedding_1d(self.freq_dim, 1000).to(x.device)
-        t_idx = (t * 999).long().clamp(0, 999)
-        t_mod = self.time_embed(t_emb[t_idx])                 # (B, in_dim)
+        # ── Patch embed ───────────────────────────────────────────────────────
+        tokens = self.patch_embedding(x)              # (B, dim, T, H, W)
+        tokens = tokens.flatten(2).transpose(1, 2)    # (B, T*H*W, dim)
 
-        # Patchify + embed
-        tokens = self.patchify(x, patch_size)                 # (B, L, C*pt*ph*pw)
-        tokens = self.patch_embed(tokens)                     # (B, L, in_dim)
+        # ── Timestep modulation ───────────────────────────────────────────────
+        t_emb  = sinusoidal_embedding_1d(self.freq_dim, 1000).to(x.device)
+        t_idx  = (t * 999).long().clamp(0, 999)
+        t_h    = self.time_embedding(t_emb[t_idx])          # (B, dim)
+        t_mod  = self.time_projection(t_h).view(B, 6, self.dim)  # (B, 6, dim)
 
-        # Project audio
-        audio_ctx = self.audio_proj(audio_features)           # (B, L_audio, in_dim)
+        # ── Audio conditioning ────────────────────────────────────────────────
+        audio_emb  = self.audio_emb(audio_features)          # (B, L, dim)
+        global_tok = self.audio_proj(audio_emb)               # (B, 32, dim)
+        audio_ctx  = torch.cat([audio_emb, global_tok], dim=1)  # (B, L+32, dim)
 
-        # Precompute RoPE if not provided
+        # ── RoPE ─────────────────────────────────────────────────────────────
         if freqs_cis is None:
             freqs_cis = precompute_freqs_cis_3d(
-                self.head_dim, gt, gh, gw
+                self.head_dim, T, H, W
             ).to(x.device)
 
-        # Transformer blocks
+        # ── Transformer ───────────────────────────────────────────────────────
         for block in self.blocks:
             tokens = block(tokens, t_mod, audio_ctx, freqs_cis)
 
-        # Head + unpatchify
-        tokens = self.head(tokens, t_mod)
-        return self.unpatchify(tokens, gt, gh, gw, patch_size)
+        # ── Head + unpatchify ─────────────────────────────────────────────────
+        tokens = self.head(tokens, t_mod)                     # (B, T*H*W, out_channels)
+        tokens = tokens.transpose(1, 2).view(B, self.out_channels, T, H, W)
+        return tokens
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy alias — kept so old code that imports ExpressionModel still works
+# ─────────────────────────────────────────────────────────────────────────────
+
+ExpressionModel = BitHumanExpressionModel

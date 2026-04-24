@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -139,37 +140,49 @@ class BitHumanPipeline:
         with open(config_path) as f:
             cfg = json.load(f)
 
-        # VAE
+        # VAE — uses LtxVAE (wraps AutoencoderKLLTXVideo; fixes green-screen)
         try:
-            from bithuman_expression.ltx_video.ltx_vae import LTXVae
-            vae_dir = self.ckpt_dir / "vae"
+            from bithuman_expression.ltx_video.ltx_vae import LtxVAE
+            vae_dir = self.models_dir / "bithuman-expression" / "VAE_LTX"
             if not vae_dir.exists():
-                vae_dir = self.models_dir / "vae"
-            if vae_dir.exists():
-                self.vae = LTXVae.from_pretrained(str(vae_dir)).to(self.device)
-                self.vae.eval()
-                logger.info("[BitHumanPipeline] LTX VAE loaded")
+                vae_dir = self.ckpt_dir.parent / "VAE_LTX"
+            vae_src = str(vae_dir) if vae_dir.exists() else "Lightricks/LTX-Video"
+            self.vae = LtxVAE(
+                pretrained_model_type_or_path=vae_src,
+                dtype=torch.bfloat16,
+                device=str(self.device),
+            )
+            logger.info(f"[BitHumanPipeline] LTX VAE loaded from {vae_src}")
         except Exception as e:
             logger.error(f"[BitHumanPipeline] VAE load failed: {e}")
 
-        # Expression model
+        # Expression model — config keys are at top level (not nested)
         try:
             from bithuman_expression.src.modules.expression_model import ExpressionModel
-            m_cfg = cfg.get("expression_model", {})
+            from safetensors.torch import load_file as load_safetensors
             self.model = ExpressionModel(
-                in_dim     = m_cfg.get("in_dim",     512),
-                out_dim    = m_cfg.get("out_dim",    512),
-                freq_dim   = m_cfg.get("freq_dim",   256),
-                ffn_dim    = m_cfg.get("ffn_dim",    2048),
-                num_heads  = m_cfg.get("num_heads",  8),
-                num_layers = m_cfg.get("num_layers", 12),
-                text_dim   = m_cfg.get("text_dim",   768),
+                dim         = cfg.get("dim",        1536),
+                in_channels = cfg.get("in_dim",      256),
+                out_channels= cfg.get("out_dim",     128),
+                freq_dim    = cfg.get("freq_dim",    256),
+                ffn_dim     = cfg.get("ffn_dim",    8960),
+                num_heads   = cfg.get("num_heads",    12),
+                num_layers  = cfg.get("num_layers",   30),
+                text_dim    = cfg.get("text_dim",   4096),
             ).to(self.device)
 
-            ckpt = self.ckpt_dir / "expression_model.pt"
-            if ckpt.exists():
-                state = torch.load(ckpt, map_location=self.device)
+            branded   = self.ckpt_dir / "bithuman_expression_dit_1_3b.safetensors"
+            naalanda  = self.ckpt_dir / "naalanda_expression_dit.safetensors"
+            legacy    = self.ckpt_dir / "diffusion_pytorch_model.safetensors"
+            ckpt      = (branded  if branded.exists()  else
+                         naalanda if naalanda.exists() else
+                         legacy   if legacy.exists()   else None)
+            if ckpt:
+                state = load_safetensors(str(ckpt), device=str(self.device))
+                if any(k.startswith("bithuman.") for k in state):
+                    state = {k.removeprefix("bithuman."): v for k, v in state.items()}
                 self.model.load_state_dict(state, strict=False)
+                logger.info(f"[BitHumanPipeline] ExpressionModel weights loaded from {ckpt.name}")
 
             self.model.eval()
 
@@ -244,31 +257,91 @@ class BitHumanPipeline:
         """
         Run denoising loop then decode latents to RGB frames.
 
+        Implements flow-matching Euler denoising:
+          x = cat([noisy_latent(128-ch), ref_latent(128-ch)], dim=1) → model(256-ch)
+          v = model output (128-ch velocity)
+          x_noisy += dt * v  (Euler step)
+
         Args:
             audio_emb: (B, T, hidden_size) from encode_audio()
-            params:    dict from get_infer_params() containing:
-                         'cond_image_dict', 'timesteps', 'guidance_scale',
-                         'num_inference_steps', 'motion_frames_num', 'tgt_fps'
+            params:    dict from get_infer_params()
 
         Returns:
-            (frames, timings) where:
-              frames:  list of (H, W, 3) uint8 numpy arrays
-              timings: dict with stage timing in ms
+            (frames, timings) — list of (H, W, 3) uint8 numpy arrays + timing dict
         """
-        from bithuman_expression.src.pipeline.expression_pipeline import (
-            ExpressionPipeline,
-        )
-
         t_start = time.perf_counter()
 
-        # Run DiT denoising via ExpressionPipeline
-        exp_pipeline: ExpressionPipeline = params["_expression_pipeline"]
-        latent = exp_pipeline.generate(audio_emb, params)  # (B, C, T, H, W)
+        if self.model is None:
+            num_frames = params.get("num_frames", audio_emb.shape[1])
+            blank = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            return [blank] * num_frames, {"denoise_ms": 0, "decode_ms": 0, "total_ms": 0}
+
+        cond_dict      = params.get("cond_image_dict")
+        timesteps      = params.get("timesteps", torch.linspace(1.0, 0.0, 21)[:-1]).to(self.device)
+        guidance_scale = float(params.get("guidance_scale", 3.5))
+        num_frames     = params.get("num_frames", audio_emb.shape[1])
+
+        B         = audio_emb.shape[0]
+        audio_emb = audio_emb.to(self.device)
+
+        # Latent dims: VAE stride [8, 32, 32] (time, height, width)
+        H_lat = self.height // 32
+        W_lat = self.width  // 32
+        T_lat = max(1, (num_frames - 1) // 8 + 1)
+
+        # Encode reference frame → ref_latent (128-ch)
+        ref_latent = None
+        if self.vae is not None and cond_dict is not None:
+            ref_video = cond_dict.get("ref_frames") or cond_dict.get("ref_image")
+            if ref_video is not None:
+                if ref_video.ndim == 4:
+                    ref_video = ref_video.unsqueeze(0)  # add batch dim if missing
+                ref_frame = ref_video[:B, :, 0:1, :, :]  # (B, 3, 1, H, W)
+                if ref_frame.shape[-2] != self.height or ref_frame.shape[-1] != self.width:
+                    ref_frame = F.interpolate(
+                        ref_frame.squeeze(2),
+                        size=(self.height, self.width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).unsqueeze(2)
+                ref_frame = ref_frame.to(dtype=torch.bfloat16)
+                try:
+                    ref_enc = self.vae.encode(ref_frame)  # (128, 1, H_lat, W_lat) — no batch dim
+                    ref_enc = ref_enc[:, :1, :, :]        # ensure T=1
+                    # Expand to (B, 128, T_lat, H_lat, W_lat)
+                    ref_latent = ref_enc.unsqueeze(0).expand(B, -1, T_lat, -1, -1).to(audio_emb.dtype)
+                except Exception as e:
+                    logger.warning(f"[BitHumanPipeline] VAE encode failed, using zeros: {e}")
+
+        if ref_latent is None:
+            ref_latent = torch.zeros(B, 128, T_lat, H_lat, W_lat, device=self.device, dtype=audio_emb.dtype)
+        else:
+            ref_latent = ref_latent.to(self.device)
+
+        # Start from pure noise
+        x_noisy = torch.randn(B, 128, T_lat, H_lat, W_lat, device=self.device, dtype=audio_emb.dtype)
+
+        # Euler flow-matching denoising loop
+        for i, t_val in enumerate(timesteps):
+            t = t_val.expand(B).to(self.device)
+            x = torch.cat([x_noisy, ref_latent], dim=1)  # (B, 256, T_lat, H_lat, W_lat)
+
+            v_cond = self.model(x, t, audio_emb)
+
+            if guidance_scale != 1.0:
+                null_audio = torch.zeros_like(audio_emb)
+                v_uncond   = self.model(x, t, null_audio)
+                v = v_uncond + guidance_scale * (v_cond - v_uncond)
+            else:
+                v = v_cond
+
+            dt      = (timesteps[i + 1] - t_val) if i + 1 < len(timesteps) else -t_val
+            x_noisy = x_noisy + dt * v
 
         t_denoise = time.perf_counter()
 
-        # VAE decode latent → pixel space
-        frames = self._decode_latent(latent)
+        # Decode final latent → RGB frames
+        frames = self._decode_latent(x_noisy)
 
         t_decode = time.perf_counter()
 
@@ -282,33 +355,27 @@ class BitHumanPipeline:
     def _decode_latent(self, latent: torch.Tensor) -> List[np.ndarray]:
         """
         Decode a (B, C, T, H, W) latent tensor to a list of RGB numpy frames.
-        Uses fast decoder if available, otherwise falls back to LTX VAE.
-        """
-        B, C, T, H, W = latent.shape
-        frames = []
 
-        if self._fast_decoder is not None:
-            pixels = self._fast_decoder(latent)  # (B, 3, T, H', W')
-        elif self.vae is not None:
-            # LTXVae.decode(zs) expects a single (C, T, H, W) tensor (no batch dim)
-            # and returns the decoded image tensor directly (no .sample wrapper).
-            # It internally does zs.unsqueeze(0) to add the batch dim.
-            decoded = self.vae.decode(latent[0])    # → (1, 3, T, H', W') or (3, T, H', W')
-            pixels = decoded.unsqueeze(0) if decoded.dim() == 4 else decoded  # ensure (B,3,T,H',W')
+        Green-screen fix: LtxVAE.decode() now uses AutoencoderKLLTXVideo
+        (working diffusers implementation) instead of the decompiled
+        CausalVideoAutoencoder whose forward() was incomplete.
+        """
+        _B, _C, T, _H, _W = latent.shape
+
+        if self.vae is not None:
+            # LtxVAE.decode(zs) takes (C, T, H, W) and returns (3, T, H', W')
+            pixels = self.vae.decode(latent[0])  # (3, T, H', W')
+        elif self._fast_decoder is not None:
+            # Fast decoder: (B, C, T, H, W) → (B, 3, T, H', W')
+            pixels = self._fast_decoder(latent)[0]  # (3, T, H', W')
         else:
-            # No decoder available — return black frames as placeholder
             return [np.zeros((self.height, self.width, 3), dtype=np.uint8)] * T
 
-        # Convert (B, 3, T, H, W) → list of (H, W, 3) uint8
-        pixels = pixels[0]                                # (3, T, H, W)
-        pixels = pixels.permute(1, 2, 3, 0)               # (T, H, W, 3)
+        # (3, T, H, W) → (T, H, W, 3) → uint8
+        pixels = pixels.permute(1, 2, 3, 0)
         pixels = ((pixels.float().clamp(-1, 1) + 1) / 2 * 255).byte()
         pixels = pixels.cpu().numpy()
-
-        for i in range(pixels.shape[0]):
-            frames.append(pixels[i])
-
-        return frames
+        return [pixels[i] for i in range(pixels.shape[0])]
 
 
 # ---------------------------------------------------------------------------
@@ -387,33 +454,80 @@ def _warmup(pipeline: BitHumanPipeline):
 
 
 def _make_expression_pipeline(pipeline: BitHumanPipeline):
-    """Create a lightweight ExpressionPipeline shim backed by pipeline.model."""
-    from bithuman_expression.src.pipeline.expression_pipeline import ExpressionPipeline
+    """
+    Denoising shim backed by pipeline.model.
+
+    For actual inference (cond_image_dict present):
+      - VAE-encodes the reference image → ref_latent (128-ch)
+      - Runs Euler denoising: x_input = [noise || ref_latent] (256-ch) at each step
+      - Returns the final clean latent (128-ch) for VAE decode
+
+    For warmup (no cond_image_dict):
+      - Single dummy forward pass to warm up CUDA kernels; result discarded
+    """
 
     class _Shim:
         def generate(self, audio_emb, params):
-            # Delegate to pipeline.model directly
+            device = pipeline.device
+            dtype  = audio_emb.dtype
+            B, T_audio = audio_emb.shape[0], audio_emb.shape[1]
+
+            # Latent spatial size: VAE spatial stride is 32 (vae_stride=[8,32,32])
+            # Temporal: use audio length directly (1 latent frame ≈ 1 video frame at 25fps)
+            T_lat = T_audio
+            H_lat = pipeline.height // 32
+            W_lat = pipeline.width  // 32
+
             if pipeline.model is None:
-                T = audio_emb.shape[1]
-                H = pipeline.height // 8
-                W = pipeline.width  // 8
-                return torch.zeros(
-                    1, 4, T, H, W,
-                    device=pipeline.device,
-                    dtype=audio_emb.dtype,
-                )
-            return pipeline.model(
-                x=torch.randn(
-                    1, 4,
-                    audio_emb.shape[1],
-                    pipeline.height // 8,
-                    pipeline.width  // 8,
-                    device=pipeline.device,
-                    dtype=audio_emb.dtype,
-                ),
-                t=torch.tensor([0.5], device=pipeline.device),
-                audio_features=audio_emb,
-            )
+                return torch.zeros(B, 128, T_lat, H_lat, W_lat, device=device, dtype=dtype)
+
+            # ── Get reference image latent ─────────────────────────────────────
+            cond_dict = params.get("cond_image_dict")
+            ref_latent = None
+            if pipeline.vae is not None and cond_dict is not None:
+                ref_image = cond_dict.get("ref_image")  # (B, 3, 1, H, W)
+                if ref_image is not None:
+                    try:
+                        # encode() takes (B, 3, T, H, W) → returns (128, T_l, H_l, W_l)
+                        ref_enc = pipeline.vae.encode(
+                            ref_image.to(device, dtype=torch.bfloat16)
+                        )  # (128, 1, H_lat, W_lat) — no batch dim
+                        T_lat = T_audio
+                        H_lat = ref_enc.shape[-2]
+                        W_lat = ref_enc.shape[-1]
+                        # Expand single reference frame to all T video frames
+                        ref_latent = ref_enc[:, :1, :, :].expand(-1, T_lat, -1, -1)
+                        ref_latent = ref_latent.unsqueeze(0).expand(B, -1, -1, -1, -1)
+                        ref_latent = ref_latent.to(dtype=dtype)
+                    except Exception as e:
+                        logger.warning(f"[pipeline] VAE encode failed ({e}); using zeros ref")
+
+            if ref_latent is None:
+                ref_latent = torch.zeros(B, 128, T_lat, H_lat, W_lat, device=device, dtype=dtype)
+
+            # ── Euler denoising loop ───────────────────────────────────────────
+            timesteps      = params.get("timesteps", torch.linspace(1.0, 0.0, 21)[:-1]).to(device)
+            guidance_scale = params.get("guidance_scale", 3.5)
+
+            x_t = torch.randn(B, 128, T_lat, H_lat, W_lat, device=device, dtype=dtype)
+
+            for i, t_val in enumerate(timesteps):
+                t = t_val.expand(B).to(device)
+                # Concatenate noisy latent with reference latent along channel dim
+                x_input = torch.cat([x_t, ref_latent], dim=1)   # (B, 256, T, H, W)
+                v_cond  = pipeline.model(x_input, t, audio_emb)  # (B, 128, T, H, W)
+
+                if guidance_scale != 1.0:
+                    null_audio = torch.zeros_like(audio_emb)
+                    v_uncond   = pipeline.model(x_input, t, null_audio)
+                    v = v_uncond + guidance_scale * (v_cond - v_uncond)
+                else:
+                    v = v_cond
+
+                dt  = (timesteps[i + 1] - t_val) if i + 1 < len(timesteps) else -t_val
+                x_t = x_t + dt * v
+
+            return x_t  # (B, 128, T_lat, H_lat, W_lat)
 
     return _Shim()
 

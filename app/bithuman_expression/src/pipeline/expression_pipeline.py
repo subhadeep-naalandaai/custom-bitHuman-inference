@@ -126,25 +126,33 @@ class ExpressionPipeline:
 
         logger.info(f"[ExpressionPipeline] Loading models from {self.model_dir}")
 
-        # Load expression model
+        # Load expression model — config keys are at top level (not nested)
         try:
             from bithuman_expression.src.modules.expression_model import ExpressionModel
-            model_cfg = cfg.get("expression_model", {})
+            from safetensors.torch import load_file as load_safetensors
             self._model = ExpressionModel(
-                in_dim     = model_cfg.get("in_dim",     512),
-                out_dim    = model_cfg.get("out_dim",    512),
-                freq_dim   = model_cfg.get("freq_dim",   256),
-                ffn_dim    = model_cfg.get("ffn_dim",    2048),
-                num_heads  = model_cfg.get("num_heads",  8),
-                num_layers = model_cfg.get("num_layers", 12),
-                text_dim   = model_cfg.get("text_dim",   768),
+                dim         = cfg.get("dim",        1536),
+                in_channels = cfg.get("in_dim",      256),
+                out_channels= cfg.get("out_dim",     128),
+                freq_dim    = cfg.get("freq_dim",    256),
+                ffn_dim     = cfg.get("ffn_dim",    8960),
+                num_heads   = cfg.get("num_heads",    12),
+                num_layers  = cfg.get("num_layers",   30),
+                text_dim    = cfg.get("text_dim",   4096),
             ).to(self._device)
 
-            ckpt = self.model_dir / "expression_model.pt"
-            if ckpt.exists():
-                state = torch.load(ckpt, map_location=self._device)
+            branded   = self.model_dir / "bithuman_expression_dit_1_3b.safetensors"
+            naalanda  = self.model_dir / "naalanda_expression_dit.safetensors"
+            legacy    = self.model_dir / "diffusion_pytorch_model.safetensors"
+            ckpt      = (branded  if branded.exists()  else
+                         naalanda if naalanda.exists() else
+                         legacy   if legacy.exists()   else None)
+            if ckpt:
+                state = load_safetensors(str(ckpt), device=str(self._device))
+                if any(k.startswith("bithuman.") for k in state):
+                    state = {k.removeprefix("bithuman."): v for k, v in state.items()}
                 self._model.load_state_dict(state, strict=False)
-                logger.info("[ExpressionPipeline] Loaded expression model weights")
+                logger.info(f"[ExpressionPipeline] Loaded expression model weights from {ckpt.name}")
 
             self._model.eval()
         except Exception as e:
@@ -292,12 +300,12 @@ class ExpressionPipeline:
             t = t_val.expand(latent_shape[0]).to(self._device)
 
             # Conditional prediction
-            v_cond = self._model(x, t, audio_features, patch_size)
+            v_cond = self._model(x, t, audio_features)
 
             if guidance_scale != 1.0:
                 # Unconditional prediction (zero audio context)
                 null_audio = torch.zeros_like(audio_features)
-                v_uncond = self._model(x, t, null_audio, patch_size)
+                v_uncond = self._model(x, t, null_audio)
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
                 v = v_cond

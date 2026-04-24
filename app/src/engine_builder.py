@@ -11,7 +11,7 @@ This is the ONLY code path that loads DiT weights and never touches
 safetensors directly from other modules, so branding changes are isolated here.
 
 Exports:
-  resolve_engine(engine_path, ckpt_dir, cache_dir) → (path_or_none, use_pytorch_fallback)
+  resolve_engine(engine_path, ckpt_dir, cache_dir, device_id) → (path_or_none, use_pytorch_fallback)
   load_dit_model(model_dir)                         → ExpressionModel (eval, on device)
   build_trt_engine(engine_path, ckpt_dir, ...)      → engine_path
   export_onnx(onnx_path, ckpt_dir)                  → onnx_path
@@ -82,17 +82,18 @@ def load_dit_model(model_dir: Union[str, Path]) -> torch.nn.Module:
 
     from bithuman_expression.src.modules.expression_model import ExpressionModel
 
-    m_cfg = cfg.get("expression_model", {})
+    # Config keys are at top level (not nested under "expression_model")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = ExpressionModel(
-        in_dim     = m_cfg.get("in_dim",     512),
-        out_dim    = m_cfg.get("out_dim",    512),
-        freq_dim   = m_cfg.get("freq_dim",   256),
-        ffn_dim    = m_cfg.get("ffn_dim",    2048),
-        num_heads  = m_cfg.get("num_heads",  8),
-        num_layers = m_cfg.get("num_layers", 12),
-        text_dim   = m_cfg.get("text_dim",   768),
+        dim         = cfg.get("dim",        1536),
+        in_channels = cfg.get("in_dim",      256),
+        out_channels= cfg.get("out_dim",     128),
+        freq_dim    = cfg.get("freq_dim",    256),
+        ffn_dim     = cfg.get("ffn_dim",    8960),
+        num_heads   = cfg.get("num_heads",    12),
+        num_layers  = cfg.get("num_layers",   30),
+        text_dim    = cfg.get("text_dim",   4096),
     ).to(device)
 
     safetensors_path = _find_safetensors(model_dir)
@@ -316,6 +317,7 @@ def resolve_engine(
     engine_path: Optional[Union[str, Path]],
     ckpt_dir: Optional[Union[str, Path]] = None,
     cache_dir: Optional[Union[str, Path]] = None,
+    device_id: int = 0,
 ) -> Tuple[Optional[Path], bool]:
     """
     GPU-universal TRT engine resolution with three-tier fallback.
