@@ -92,8 +92,12 @@ class ExpressionVideoGenerator:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self, image_path=None, prompt=None) -> None:
         """Start inference and reader background tasks."""
+        if image_path is not None:
+            self._image_path = str(image_path)
+        if prompt is not None:
+            self._prompt = prompt
         if self._running:
             return
         self._running = True

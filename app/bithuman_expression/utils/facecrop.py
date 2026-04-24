@@ -66,6 +66,8 @@ def process_image(
     from bithuman_expression.utils.cpu_face_handler import CPUFaceHandler
 
     # Normalise input to PIL and numpy
+    if isinstance(image, str):
+        image = Image.open(image)
     if isinstance(image, np.ndarray):
         pil_img = Image.fromarray(image.astype(np.uint8), "RGB")
         arr = image.astype(np.uint8)
