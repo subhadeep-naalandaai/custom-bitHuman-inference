@@ -25,14 +25,14 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
-    print(f"Downloading Lightricks/LTX-Video → {output} …")
-    print("This is ~12 GB; grab a coffee.")
+    print(f"Downloading Lightricks/LTX-Video (transformer + vae only) → {output} …")
+    print("This is ~8 GB (transformer ~6GB + vae ~1.7GB); skipping text encoders.")
 
     path = snapshot_download(
         repo_id="Lightricks/LTX-Video",
         local_dir=str(output),
-        # Skip large quantised variants to save space
-        ignore_patterns=["*.gguf", "ltx-video-2b-*", "*distilled*"],
+        # Only need transformer/ and vae/ — skip everything else to save ~100GB
+        allow_patterns=["transformer/*", "vae/*"],
         token=args.token,
     )
     print(f"\nDone. Weights at: {path}")
