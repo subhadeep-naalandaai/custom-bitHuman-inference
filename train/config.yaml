@@ -1,0 +1,74 @@
+# Naalanda Expression Model — training configuration
+
+model:
+  dim: 1536
+  num_heads: 12
+  num_layers: 30
+  ffn_dim: 8960
+  in_channels: 256       # noisy_latent(128) ∥ ref_latent(128)
+  out_channels: 128      # velocity field
+  freq_dim: 256          # sinusoidal timestep embedding
+  audio_dim: 768         # Wav2Vec2-base hidden size
+  text_dim: 4096         # kept for compat; unused in audio-only mode
+
+data:
+  # List of dataset root directories — each must be preprocessed first
+  # with train/preprocess.py
+  preprocessed_dirs:
+    - data/preprocessed/voxceleb2
+    - data/preprocessed/hdtf
+  clip_duration_min: 2.0      # seconds
+  clip_duration_max: 8.0
+  fps: 25
+  resolution: 512
+  sample_rate: 16000
+  # Fraction of dataset to use for validation
+  val_fraction: 0.005
+
+training:
+  seed: 42
+  output_dir: checkpoints/
+  # Total optimisation steps
+  total_steps: 100000
+  # Per-GPU batch size
+  batch_size: 4
+  # Gradient accumulation → effective batch = batch_size × num_gpus × grad_accumulation
+  grad_accumulation: 8
+  # AdamW hyperparameters
+  lr: 3.0e-5
+  weight_decay: 1.0e-2
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  # Warmup + cosine decay
+  warmup_steps: 1000
+  lr_schedule: cosine
+  # Gradient clipping
+  grad_clip: 1.0
+  # Classifier-free guidance: drop audio conditioning with this probability
+  cfg_dropout_prob: 0.1
+  # Mixed precision (bf16 recommended on A100/H100; fp16 for older GPUs)
+  mixed_precision: bf16
+  # Checkpoint every N steps
+  checkpoint_every: 5000
+  # Log to console every N steps
+  log_every: 100
+  # Run validation every N steps
+  val_every: 2500
+  # Resume from checkpoint (path or null)
+  resume_from: null
+
+vae:
+  # VAE path — can be bh-weights/bithuman-expression/VAE_LTX or ltx-weights/vae
+  path: bh-weights/bithuman-expression/VAE_LTX
+  dtype: bfloat16
+
+wav2vec:
+  # Wav2Vec2 checkpoint for audio encoding (frozen throughout training)
+  path: app/bundled/wav2vec2-base-960h
+  freeze: true
+
+init:
+  # LTX-Video transformer weights for SVD-based weight initialisation
+  ltx_transformer_dir: ltx-weights/transformer
+  # How many LTX-Video blocks to use (LTX has 28, ours has 30; last 2 are duplicated)
+  ltx_num_blocks: 28

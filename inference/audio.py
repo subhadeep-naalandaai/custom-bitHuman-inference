@@ -1,59 +1,62 @@
 """
-Audio encoder: WAV file → fixed-length Wav2Vec2 features.
+Audio encoder: Wav2Vec2-base-960h wrapper.
 
-The DiT expects exactly 30 audio frames (after audio_emb.proj) per video chunk.
-We adaptive-pool Wav2Vec2 output to AUDIO_FRAMES=30 regardless of audio length.
+Takes raw 16 kHz waveform, returns per-frame feature vectors (768-dim).
+Standalone — does not import from app/.
 """
 import torch
 import torch.nn.functional as F
 
-AUDIO_FRAMES = 30   # matches audio_proj.proj1.weight input dim / 1536
-SAMPLE_RATE = 16000
+
+def load_wav2vec(model_dir: str, device: str = "cuda") -> "Wav2Vec2Model":
+    """Load Wav2Vec2-base from a local directory or HuggingFace."""
+    from transformers import Wav2Vec2Model as _HF, Wav2Vec2Config
+
+    try:
+        model = _HF.from_pretrained(model_dir)
+    except Exception:
+        model = _HF(Wav2Vec2Config())
+    return model.to(device).eval()
 
 
-class AudioEncoder:
-    def __init__(self, model_path: str = "app/bundled/wav2vec2-base-960h", device: str = "cuda"):
-        from transformers import Wav2Vec2Model, Wav2Vec2FeatureExtractor
-        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_path)
-        self.model = Wav2Vec2Model.from_pretrained(model_path).to(device).eval()
-        self.device = device
+def encode_audio(
+    wav2vec,
+    waveform: torch.Tensor,
+    num_frames: int,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Encode raw audio waveform to Wav2Vec2 feature vectors.
 
-    @torch.no_grad()
-    def encode(self, audio_path: str) -> torch.Tensor:
-        """
-        Returns [1, AUDIO_FRAMES, 768] Wav2Vec2 features.
-        """
-        import torchaudio
-        waveform, sr = torchaudio.load(audio_path)
-        if sr != SAMPLE_RATE:
-            waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
-        waveform = waveform.mean(0)  # → mono [samples]
+    Args:
+        wav2vec:    loaded Wav2Vec2Model (from load_wav2vec)
+        waveform:   (T_audio,) or (B, T_audio) float32 at 16 kHz
+        num_frames: target output length (number of video frames)
+        device:     inference device
 
-        inputs = self.feature_extractor(
-            waveform.numpy(), sampling_rate=SAMPLE_RATE, return_tensors="pt"
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        hidden = self.model(**inputs).last_hidden_state  # [1, T_audio, 768]
+    Returns:
+        (B, num_frames, 768) float tensor
+    """
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    waveform = waveform.to(device, dtype=torch.float32)
 
-        # Pool temporal dim to fixed AUDIO_FRAMES
-        hidden = F.adaptive_avg_pool1d(
-            hidden.transpose(1, 2), AUDIO_FRAMES
-        ).transpose(1, 2)   # [1, AUDIO_FRAMES, 768]
+    with torch.no_grad():
+        # Extract CNN features, shape: (B, C, T_feat)
+        feats = wav2vec.feature_extractor(waveform)
+        # (B, T_feat, C)
+        feats = feats.transpose(1, 2)
+        # Interpolate to target num_frames
+        if feats.shape[1] != num_frames:
+            feats = F.interpolate(
+                feats.permute(0, 2, 1).float(),
+                size=num_frames,
+                mode="linear",
+                align_corners=False,
+            ).permute(0, 2, 1)
+        # Feature projection: (B, T, hidden_size)
+        feats, _ = wav2vec.feature_projection(feats)
+        # Transformer encoder
+        out = wav2vec.encoder(feats).last_hidden_state
 
-        return hidden
-
-    @torch.no_grad()
-    def encode_waveform(self, waveform: torch.Tensor) -> torch.Tensor:
-        """
-        waveform: [samples] float32 at SAMPLE_RATE Hz.
-        Returns [1, AUDIO_FRAMES, 768].
-        """
-        inputs = self.feature_extractor(
-            waveform.cpu().numpy(), sampling_rate=SAMPLE_RATE, return_tensors="pt"
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        hidden = self.model(**inputs).last_hidden_state  # [1, T_audio, 768]
-        hidden = F.adaptive_avg_pool1d(
-            hidden.transpose(1, 2), AUDIO_FRAMES
-        ).transpose(1, 2)
-        return hidden
+    return out  # (B, num_frames, 768)
