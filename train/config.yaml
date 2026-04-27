@@ -28,7 +28,7 @@ training:
   seed: 42
   output_dir: checkpoints/
   # Total optimisation steps
-  total_steps: 100000
+  total_steps: 10000
   # Per-GPU batch size
   batch_size: 1
   # Gradient accumulation → effective batch = batch_size × num_gpus × grad_accumulation
@@ -48,7 +48,7 @@ training:
   # Mixed precision (bf16 recommended on A100/H100; fp16 for older GPUs)
   mixed_precision: bf16
   # Checkpoint every N steps
-  checkpoint_every: 5000
+  checkpoint_every: 2000
   # Log to console every N steps
   log_every: 100
   # Run validation every N steps
