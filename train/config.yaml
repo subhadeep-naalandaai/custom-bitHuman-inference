@@ -15,7 +15,6 @@ data:
   # List of dataset root directories — each must be preprocessed first
   # with train/preprocess.py
   preprocessed_dirs:
-    - data/preprocessed/voxceleb2
     - data/preprocessed/hdtf
   clip_duration_min: 2.0      # seconds
   clip_duration_max: 8.0
