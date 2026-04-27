@@ -280,6 +280,14 @@ class ExpressionModel(nn.Module):
         ])
         self.head = OutputHead(dim, out_channels)
 
+        # Zero-gate init: time_projection and cross-attn output start at zero so
+        # gate_sa/gate_ff ≈ 0 at step 0 → model is near-identity → stable loss start
+        nn.init.zeros_(self.time_projection[-1].weight)
+        nn.init.zeros_(self.time_projection[-1].bias)
+        for block in self.blocks:
+            nn.init.zeros_(block.cross_attn.o.weight)
+            nn.init.zeros_(block.cross_attn.o.bias)
+
     def forward(
         self,
         x:              torch.Tensor,
