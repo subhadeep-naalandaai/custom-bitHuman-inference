@@ -149,15 +149,16 @@ def main():
     from inference.model import ExpressionModel
     mcfg = cfg["model"]
     model = ExpressionModel(
-        dim         = mcfg["dim"],
-        in_channels = mcfg["in_channels"],
-        out_channels= mcfg["out_channels"],
-        freq_dim    = mcfg["freq_dim"],
-        ffn_dim     = mcfg["ffn_dim"],
-        num_heads   = mcfg["num_heads"],
-        num_layers  = mcfg["num_layers"],
-        audio_dim   = mcfg["audio_dim"],
-        text_dim    = mcfg["text_dim"],
+        dim                    = mcfg["dim"],
+        in_channels            = mcfg["in_channels"],
+        out_channels           = mcfg["out_channels"],
+        freq_dim               = mcfg["freq_dim"],
+        ffn_dim                = mcfg["ffn_dim"],
+        num_heads              = mcfg["num_heads"],
+        num_layers             = mcfg["num_layers"],
+        audio_dim              = mcfg["audio_dim"],
+        text_dim               = mcfg["text_dim"],
+        gradient_checkpointing = True,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e9

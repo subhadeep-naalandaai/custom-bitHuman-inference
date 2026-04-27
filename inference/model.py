@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,23 +233,25 @@ class ExpressionModel(nn.Module):
 
     def __init__(
         self,
-        dim:          int = 1536,
-        in_channels:  int = 256,
-        out_channels: int = 128,
-        freq_dim:     int = 256,
-        ffn_dim:      int = 8960,
-        num_heads:    int = 12,
-        num_layers:   int = 30,
-        audio_dim:    int = 768,
-        text_dim:     int = 4096,
+        dim:                    int  = 1536,
+        in_channels:            int  = 256,
+        out_channels:           int  = 128,
+        freq_dim:               int  = 256,
+        ffn_dim:                int  = 8960,
+        num_heads:              int  = 12,
+        num_layers:             int  = 30,
+        audio_dim:              int  = 768,
+        text_dim:               int  = 4096,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
-        self.dim          = dim
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.freq_dim     = freq_dim
-        self.num_heads    = num_heads
-        self.head_dim     = dim // num_heads
+        self.dim                    = dim
+        self.in_channels            = in_channels
+        self.out_channels           = out_channels
+        self.freq_dim               = freq_dim
+        self.num_heads              = num_heads
+        self.head_dim               = dim // num_heads
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.patch_embedding = nn.Conv3d(in_channels, dim, kernel_size=1, bias=True)
 
@@ -301,7 +304,12 @@ class ExpressionModel(nn.Module):
             freqs_cis = precompute_freqs_cis_3d(self.head_dim, T, H, W).to(x.device)
 
         for block in self.blocks:
-            tokens = block(tokens, t_mod, audio_ctx, freqs_cis)
+            if self.gradient_checkpointing and self.training:
+                tokens = torch.utils.checkpoint.checkpoint(
+                    block, tokens, t_mod, audio_ctx, freqs_cis, use_reentrant=False
+                )
+            else:
+                tokens = block(tokens, t_mod, audio_ctx, freqs_cis)
 
         tokens = self.head(tokens, t_mod)
         return tokens.transpose(1, 2).view(B, self.out_channels, T, H, W)
