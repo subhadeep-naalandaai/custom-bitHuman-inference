@@ -218,12 +218,24 @@ def main():
     start_step  = 0
     resume_path = args.resume or tcfg.get("resume_from")
     if resume_path and Path(resume_path).exists():
-        ckpt = torch.load(resume_path, map_location=device)
-        _model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["optimizer"])
-        start_step = ckpt.get("step", 0)
-        if _is_main():
-            logger.info(f"Resumed from {resume_path} at step {start_step}")
+        if str(resume_path).endswith(".safetensors"):
+            # Pre-trained bitHuman weights — load as raw state dict (fine-tune)
+            from safetensors.torch import load_file as load_sf
+            state = load_sf(str(resume_path), device=device)
+            if any(k.startswith("bithuman.") for k in state):
+                state = {k.removeprefix("bithuman."): v for k, v in state.items()}
+            missing, unexpected = _model.load_state_dict(state, strict=False)
+            if _is_main():
+                logger.info(f"Fine-tuning from {resume_path}  "
+                            f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        else:
+            # Training checkpoint — restore model + optimizer + step
+            ckpt = torch.load(resume_path, map_location=device, weights_only=True)
+            _model.load_state_dict(ckpt["model"])
+            opt.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt.get("step", 0)
+            if _is_main():
+                logger.info(f"Resumed from {resume_path} at step {start_step}")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     out_dir    = Path(tcfg["output_dir"])
