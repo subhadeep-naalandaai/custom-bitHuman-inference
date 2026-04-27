@@ -34,17 +34,20 @@ def precompute_freqs_cis_3d(
     head_dim: int, t_len: int, h_len: int, w_len: int, theta: float = 10000.0
 ) -> torch.Tensor:
     """3-D RoPE frequencies for (T×H×W) positions, shape (T*H*W, head_dim//2) complex."""
-    d = head_dim // 6
+    # Split head_dim evenly across T/H/W axes; assign remainder to W
+    d_each = (head_dim // 3) & ~1          # round down to even
+    d_w    = head_dim - 2 * d_each         # remainder (even by construction)
 
-    def _1d(n):
-        f = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float32) / d))
-        t = torch.arange(n, dtype=torch.float32)
-        return torch.polar(torch.ones_like(torch.outer(t, f)), torch.outer(t, f))
+    def _1d(n, d):
+        half   = d // 2
+        f      = 1.0 / (theta ** (torch.arange(half, dtype=torch.float32) / half))
+        angles = torch.outer(torch.arange(n, dtype=torch.float32), f)
+        return torch.polar(torch.ones_like(angles), angles)  # (n, half) complex
 
-    ft = _1d(t_len).unsqueeze(1).unsqueeze(1).expand(-1, h_len, w_len, -1)
-    fh = _1d(h_len).unsqueeze(0).unsqueeze(2).expand(t_len, -1, w_len, -1)
-    fw = _1d(w_len).unsqueeze(0).unsqueeze(0).expand(t_len, h_len, -1, -1)
-    freqs = torch.cat([ft, fh, fw], dim=-1)
+    ft = _1d(t_len, d_each).unsqueeze(1).unsqueeze(1).expand(-1, h_len, w_len, -1)
+    fh = _1d(h_len, d_each).unsqueeze(0).unsqueeze(2).expand(t_len, -1, w_len, -1)
+    fw = _1d(w_len, d_w).unsqueeze(0).unsqueeze(0).expand(t_len, h_len, -1, -1)
+    freqs = torch.cat([ft, fh, fw], dim=-1)   # (T, H, W, head_dim//2)
     return freqs.reshape(t_len * h_len * w_len, -1)
 
 
