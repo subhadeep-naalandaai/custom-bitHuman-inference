@@ -201,14 +201,28 @@ def main():
         logger.info(f"Train clips: {len(train_ds)}")
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
-    tcfg   = cfg["training"]
-    opt    = torch.optim.AdamW(
-        model.parameters(),
-        lr=tcfg["lr"],
-        betas=tuple(tcfg["betas"]),
-        weight_decay=tcfg["weight_decay"],
-        eps=tcfg["eps"],
-    )
+    tcfg = cfg["training"]
+    try:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(
+            model.parameters(),
+            lr=tcfg["lr"],
+            betas=tuple(tcfg["betas"]),
+            weight_decay=tcfg["weight_decay"],
+            eps=tcfg["eps"],
+        )
+        if _is_main():
+            logger.info("Using 8-bit AdamW (bitsandbytes) — saves ~9 GB optimizer state")
+    except ImportError:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=tcfg["lr"],
+            betas=tuple(tcfg["betas"]),
+            weight_decay=tcfg["weight_decay"],
+            eps=tcfg["eps"],
+        )
+        if _is_main():
+            logger.warning("bitsandbytes not found — using fp32 AdamW (may OOM on small GPUs)")
 
     # ── Mixed precision scaler ─────────────────────────────────────────────────
     mp     = tcfg.get("mixed_precision", "bf16")
