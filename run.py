@@ -79,6 +79,7 @@ def main():
         ckpt_dir    = str(ckpt_dir),
         models_dir  = str(weights_dir),
         wav2vec_dir = wav2vec_dir,
+        device      = args.device,
     )
 
     torch.manual_seed(args.seed)

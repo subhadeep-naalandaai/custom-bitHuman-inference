@@ -51,10 +51,14 @@ class NaalandaPipeline:
         ckpt_dir:   Union[str, Path],
         models_dir: Union[str, Path],
         wav2vec_dir: Optional[Union[str, Path]] = None,
+        device: Optional[str] = None,
     ):
         self.ckpt_dir   = Path(ckpt_dir)
         self.models_dir = Path(models_dir)
-        self.device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.width      = 512
         self.height     = 512
         self.tgt_fps    = 25
@@ -260,9 +264,10 @@ def get_pipeline(
     ckpt_dir:    str,
     models_dir:  str,
     wav2vec_dir: Optional[str] = None,
+    device:      Optional[str] = None,
     **_,
 ) -> NaalandaPipeline:
-    return NaalandaPipeline(ckpt_dir=ckpt_dir, models_dir=models_dir, wav2vec_dir=wav2vec_dir)
+    return NaalandaPipeline(ckpt_dir=ckpt_dir, models_dir=models_dir, wav2vec_dir=wav2vec_dir, device=device)
 
 
 def get_infer_params(
