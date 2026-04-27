@@ -85,13 +85,22 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load audio
-    import torchaudio
-    waveform, sr = torchaudio.load(args.audio)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(0, keepdim=True)
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    waveform = waveform.squeeze(0)
+    try:
+        import soundfile as sf
+        import numpy as np
+        data, sr = sf.read(args.audio, always_2d=True)
+        waveform = torch.from_numpy(data.mean(axis=1).astype(np.float32))  # mono
+        if sr != 16000:
+            import torchaudio
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+    except Exception:
+        import torchaudio
+        waveform, sr = torchaudio.load(args.audio)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(0, keepdim=True)
+        if sr != 16000:
+            waveform = torchaudio.functional.resample(waveform, sr, 16000)
+        waveform = waveform.squeeze(0)
 
     duration   = waveform.shape[0] / 16000
     num_frames = max(1, int(duration * args.fps))
