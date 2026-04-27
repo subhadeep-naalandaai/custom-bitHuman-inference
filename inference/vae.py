@@ -56,8 +56,16 @@ class LtxVAE:
         self.model  = load_vae(vae_dir, device, dtype)
 
     def _stats(self, ref: torch.Tensor):
-        mean = self.model.latents_mean.view(1, -1, 1, 1, 1).to(ref)
-        std  = self.model.latents_std.view(1, -1, 1, 1, 1).to(ref)
+        m = getattr(self.model, "latents_mean", None)
+        s = getattr(self.model, "latents_std",  None)
+        if m is not None and s is not None:
+            mean = torch.as_tensor(m).view(1, -1, 1, 1, 1).to(ref)
+            std  = torch.as_tensor(s).view(1, -1, 1, 1, 1).to(ref)
+        else:
+            # Fall back to scaling_factor (SD-style: latent / scale_factor)
+            sf   = float(getattr(self.model.config, "scaling_factor", 0.18215))
+            mean = torch.zeros(1, device=ref.device, dtype=ref.dtype)
+            std  = torch.full((1,), sf, device=ref.device, dtype=ref.dtype)
         return mean, std
 
     def normalize(self, latents: torch.Tensor) -> torch.Tensor:
