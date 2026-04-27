@@ -198,7 +198,9 @@ class NaalandaPipeline:
         # Encode reference frame
         ref_latent = None
         if self.vae is not None and cond_dict is not None:
-            ref_video = cond_dict.get("ref_frames") or cond_dict.get("ref_image")
+            ref_video = cond_dict.get("ref_frames")
+            if ref_video is None:
+                ref_video = cond_dict.get("ref_image")
             if ref_video is not None:
                 if ref_video.ndim == 4:
                     ref_video = ref_video.unsqueeze(0)
