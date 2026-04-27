@@ -30,9 +30,9 @@ training:
   # Total optimisation steps
   total_steps: 100000
   # Per-GPU batch size
-  batch_size: 4
+  batch_size: 1
   # Gradient accumulation → effective batch = batch_size × num_gpus × grad_accumulation
-  grad_accumulation: 8
+  grad_accumulation: 32
   # AdamW hyperparameters
   lr: 3.0e-5
   weight_decay: 1.0e-2
