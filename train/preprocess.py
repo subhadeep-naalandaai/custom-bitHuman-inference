@@ -46,11 +46,14 @@ logger = logging.getLogger(__name__)
 # Video loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_video_frames(path: str, target_fps: int = 25, resolution: int = 512):
+def _load_video_frames(path: str, target_fps: int = 25, resolution: int = 512, max_duration: float = 30.0):
     """
     Load video file and return (T, 3, H, W) float32 tensor in [-1, 1].
     Uses decord for fast decode; falls back to OpenCV.
+    max_duration caps frames before loading to avoid RAM exhaustion on long clips.
     """
+    max_out = max(1, int(max_duration * target_fps))
+
     try:
         import decord
         decord.bridge.set_bridge("torch")
@@ -58,14 +61,14 @@ def _load_video_frames(path: str, target_fps: int = 25, resolution: int = 512):
         src_fps = vr.get_avg_fps()
         if src_fps <= 0:
             src_fps = target_fps
-        # Sample frame indices at target_fps
         n_frames = len(vr)
         duration = n_frames / src_fps
-        n_out    = max(1, int(duration * target_fps))
+        n_out    = min(max_out, max(1, int(duration * target_fps)))
         indices  = (np.arange(n_out) * src_fps / target_fps).astype(int).clip(0, n_frames - 1)
         frames   = vr.get_batch(indices)     # (T, H, W, 3) uint8
         frames   = frames.permute(0, 3, 1, 2).float() / 127.5 - 1.0  # (T, 3, H, W) in [-1,1]
-        return frames, duration
+        actual_duration = min(duration, max_duration)
+        return frames, actual_duration
     except Exception:
         pass
 
@@ -74,7 +77,8 @@ def _load_video_frames(path: str, target_fps: int = 25, resolution: int = 512):
     cap = cv2.VideoCapture(path)
     src_fps = cap.get(cv2.CAP_PROP_FPS) or target_fps
     frames_list = []
-    while True:
+    max_src = int(max_duration * src_fps)
+    while len(frames_list) < max_src:
         ret, frame = cap.read()
         if not ret:
             break
@@ -86,7 +90,7 @@ def _load_video_frames(path: str, target_fps: int = 25, resolution: int = 512):
         return None, 0.0
     frames = torch.from_numpy(np.stack(frames_list))  # (T_src, H, W, 3) uint8
     duration = len(frames_list) / src_fps
-    n_out    = max(1, int(duration * target_fps))
+    n_out    = min(max_out, max(1, int(duration * target_fps)))
     indices  = (np.arange(n_out) * src_fps / target_fps).astype(int).clip(0, len(frames_list) - 1)
     frames   = frames[indices].permute(0, 3, 1, 2).float() / 127.5 - 1.0  # (T, 3, H, W) [-1,1]
     return frames, duration
@@ -156,14 +160,10 @@ def encode_clip(
     if output_dir.exists() and (output_dir / "latents.npy").exists():
         return True  # already done
 
-    # Load video
-    frames, duration = _load_video_frames(video_path, fps, resolution)
+    # Load video (max_duration cap applied inside to avoid RAM spike on long clips)
+    frames, duration = _load_video_frames(video_path, fps, resolution, max_duration)
     if frames is None or duration < min_duration:
         return False
-    if duration > max_duration:
-        n_keep = int(max_duration * fps)
-        frames = frames[:n_keep]
-        duration = max_duration
 
     # Apply face crop
     frames = _face_crop_frames(frames, resolution)
@@ -220,8 +220,9 @@ def main():
     parser.add_argument("--device",     default=None)
     parser.add_argument("--fps",        default=25, type=int)
     parser.add_argument("--resolution", default=512, type=int)
-    parser.add_argument("--max-clips",  default=0, type=int, help="Limit number of clips (0=all)")
-    parser.add_argument("--extensions", default="mp4,avi,mkv,mov,webm")
+    parser.add_argument("--max-clips",    default=0,   type=int,   help="Limit number of clips (0=all)")
+    parser.add_argument("--max-duration", default=8.0, type=float, help="Max clip duration in seconds (default: 8.0)")
+    parser.add_argument("--extensions",   default="mp4,avi,mkv,mov,webm")
     args = parser.parse_args()
 
     if args.device is None:
@@ -263,6 +264,7 @@ def main():
                 device=args.device,
                 fps=args.fps,
                 resolution=args.resolution,
+                max_duration=args.max_duration,
             )
             if result:
                 ok += 1
