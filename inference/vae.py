@@ -79,8 +79,12 @@ class LtxVAE:
     @torch.no_grad()
     def encode(self, video: torch.Tensor) -> torch.Tensor:
         """video: (B, 3, T, H, W) in [-1, 1] → (128, T_lat, H_lat, W_lat) normalized"""
-        video   = video.to(self.dtype)
-        latents = self.model.encode(video).latent_dist.sample()
+        # Run encode on CPU — aten::slow_conv3d_forward has no CUDA kernel in PyTorch 2.11+
+        cpu_model = self.model.cpu()
+        video_cpu = video.cpu().to(torch.float32)
+        latents   = cpu_model.encode(video_cpu).latent_dist.sample()
+        latents   = latents.to(device=self.device, dtype=self.dtype)
+        self.model.to(self.device)
         return self.normalize(latents)[0]  # drop batch dim
 
     @torch.no_grad()
