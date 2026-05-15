@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+
+# Cython compiled binaries (platform-specific, not portable)
+*.so
+
+# Model weights (too large for git — use HuggingFace)
+bh-weights/
+naalanda-weights/
+ltx-weights/
+checkpoints/
+so_archive/
+*.safetensors
+*.bin
+*.pt
+
+# Output videos
+*.mp4
+
+# Training data (preprocessed or raw)
+data/
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp
+
+# Scratch docs from previous sessions
+ARCHITECTURE_OVERRIDE.md
+ARCHITECTURE_OVERRIDE.pdf
+WORKFLOW_DIAGRAM.md
+
+# Jupyter
+.ipynb_checkpoints/

@@ -1,0 +1,6 @@
+{
+  "bos_token": "\u003Cs\u003E",
+  "eos_token": "\u003C/s\u003E",
+  "unk_token": "\u003Cunk\u003E",
+  "pad_token": "\u003Cpad\u003E"
+}

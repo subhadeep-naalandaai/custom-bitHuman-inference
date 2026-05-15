@@ -1,0 +1,36 @@
+opencv-python-headless>=4.12.0.88
+diffusers>=0.34.0,<0.37.0
+transformers>=4.46.3,<5.0.0
+tokenizers>=0.20.3
+accelerate>=1.8.1
+tqdm
+imageio
+easydict
+ftfy
+scikit-image
+loguru
+xfuser>=0.4.3
+pyloudnorm
+librosa
+einops
+safetensors
+regex
+# mediapipe installed separately in Dockerfile (pip resolver conflict with livekit-agents)
+Pillow
+pyyaml
+scipy
+# API server
+fastapi
+uvicorn
+python-multipart
+# LiveKit
+livekit-agents[silero,cartesia,deepgram]==1.3.10
+python-dotenv
+huggingface_hub
+supabase
+# gRPC (for billing heartbeat)
+grpcio>=1.60.0
+# weight encryption at rest
+cryptography>=3.4
+# ONNX export for auto-building TRT engines on new GPUs
+onnx>=1.14.0

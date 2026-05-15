@@ -1,0 +1,9 @@
+{
+  "unk_token": "\u003Cunk\u003E",
+  "bos_token": "\u003Cs\u003E",
+  "eos_token": "\u003C/s\u003E",
+  "pad_token": "\u003Cpad\u003E",
+  "do_lower_case": false,
+  "return_attention_mask": false,
+  "do_normalize": true
+}
